@@ -1,40 +1,104 @@
 plugins {
 	id 'java'
-    id 'eclipse'
-}
-
-repositories {
-	mavenLocal()
-	mavenCentral()
-	maven {
-		url "http://packages.confluent.io/maven/"
-	}
 }
 
 group = 'kconnect-outbox-smt'
-version = '1.0.1'
-sourceCompatibility = 1.8
+version = '2.0.0'
 
-dependencies {
-	implementation group: 'org.apache.kafka', name: 'connect-api', version: '2.7.0'
-	implementation group: 'org.apache.kafka', name: 'connect-transforms', version: '2.7.0'
-	implementation group: 'io.confluent', name: 'kafka-connect-avro-converter', version: '5.2.1'
+def kafkaVersion = '4.3.1'
+def confluentVersion = '8.3.2'
+def pluginName = 'kconnect-jdbc-outbox-smt'
 
-	testImplementation 'org.junit.jupiter:junit-jupiter-api:5.7.2'
-	testImplementation 'org.junit.jupiter:junit-jupiter-params:5.7.2'
-	testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.7.2'
+java {
+	toolchain {
+		languageVersion = JavaLanguageVersion.of(25)
+	}
 }
 
-test {
+// Bytecode Java 17, o mínimo do Kafka Connect 4: o plugin roda em qualquer worker 4.x.
+tasks.withType(JavaCompile).configureEach {
+	options.release = 17
+	options.encoding = 'UTF-8'
+}
+
+repositories {
+	mavenCentral()
+	maven {
+		url = 'https://packages.confluent.io/maven/'
+		content {
+			includeGroupByRegex 'io\\.confluent.*'
+		}
+	}
+}
+
+dependencies {
+	compileOnly "org.apache.kafka:connect-api:${kafkaVersion}"
+	compileOnly "org.apache.kafka:connect-transforms:${kafkaVersion}"
+	compileOnly 'org.slf4j:slf4j-api:1.7.36'
+
+	implementation "io.confluent:kafka-schema-registry-client:${confluentVersion}"
+	implementation "io.confluent:kafka-protobuf-provider:${confluentVersion}"
+	implementation "io.confluent:kafka-json-schema-provider:${confluentVersion}"
+
+	testImplementation "org.apache.kafka:connect-api:${kafkaVersion}"
+	testImplementation "org.apache.kafka:connect-transforms:${kafkaVersion}"
+	testImplementation "io.confluent:kafka-avro-serializer:${confluentVersion}"
+	testImplementation "io.confluent:kafka-protobuf-serializer:${confluentVersion}"
+	testImplementation "io.confluent:kafka-json-schema-serializer:${confluentVersion}"
+	testImplementation platform('org.junit:junit-bom:6.1.3')
+	testImplementation 'org.junit.jupiter:junit-jupiter'
+	testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+// Os artefatos do Confluent dependem do kafka-clients "-ccs" (build do Confluent, fora do Maven
+// Central): o Kafka fica sempre na versão do worker alvo.
+configurations.configureEach {
+	resolutionStrategy.eachDependency {
+		if (requested.group == 'org.apache.kafka') {
+			useVersion kafkaVersion
+		}
+	}
+}
+
+// Kafka e SLF4J vêm do worker do Kafka Connect: nunca entram no plugin.
+configurations.named('runtimeClasspath') {
+	exclude group: 'org.apache.kafka'
+	exclude group: 'org.slf4j'
+}
+
+tasks.named('test') {
 	useJUnitPlatform()
 }
 
-jar {
+tasks.named('jar') {
 	manifest {
-		attributes "Main-Class": "kconnect-outbox-smt"
+		attributes(
+			'Implementation-Title': pluginName,
+			'Implementation-Version': project.version
+		)
 	}
+}
 
-	from {
-		configurations.compile.collect { it.isDirectory() ? it : zipTree(it) }
+// Layout de plugin do Kafka Connect: um diretório com o jar do SMT e as dependências de runtime,
+// pronto para o plugin.path (ex.: /opt/kafka/plugins/kconnect-jdbc-outbox-smt/).
+tasks.register('connectPlugin', Sync) {
+	group = 'distribution'
+	description = 'Monta build/connect-plugin/ com o jar do SMT e suas dependências de runtime.'
+	from tasks.named('jar')
+	from configurations.runtimeClasspath
+	into layout.buildDirectory.dir("connect-plugin/${pluginName}")
+}
+
+tasks.register('connectPluginZip', Zip) {
+	group = 'distribution'
+	description = 'Empacota o plugin do Kafka Connect em build/distributions/.'
+	archiveFileName = "${pluginName}-${project.version}.zip"
+	destinationDirectory = layout.buildDirectory.dir('distributions')
+	from(tasks.named('connectPlugin')) {
+		into pluginName
 	}
+}
+
+tasks.named('assemble') {
+	dependsOn 'connectPluginZip'
 }

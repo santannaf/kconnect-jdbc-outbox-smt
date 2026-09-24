@@ -9,6 +9,7 @@ import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.config.ConfigDef.Importance;
 import org.apache.kafka.common.config.ConfigDef.Type;
 import org.apache.kafka.common.config.ConfigDef.Width;
+import org.apache.kafka.common.config.ConfigException;
 
 public class TransformField {
 
@@ -56,6 +57,14 @@ public class TransformField {
 
 	public int getReqInteger(Map<String, ?> transformConfigMap) {
 		return Integer.valueOf(getReqString(transformConfigMap));
+	}
+
+	public boolean getBoolean(Map<String, ?> transformConfigMap) {
+		final String value = getReqString(transformConfigMap);
+		if (!value.equalsIgnoreCase("true") && !value.equalsIgnoreCase("false")) {
+			throw new ConfigException(name, value, "must be true or false");
+		}
+		return Boolean.parseBoolean(value);
 	}
 
 	public String getReqString(Map<String, ?> transformConfigMap) {

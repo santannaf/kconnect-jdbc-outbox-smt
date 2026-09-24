@@ -24,6 +24,102 @@ Nesse processo, queremos algumas garantias:
 
 Usando debezium, existe um [transform](https://debezium.io/documentation/reference/configuration/outbox-event-router.html) que pode ser usado e que faz isso, mas não queremos usar debezium, queremos usar JdbcSourceConnector. Então criamos um transform que suporta leituras de tabelas de outbox, de eventos serializados usando KafkaAvroSerializer, suportando mudança de versão dos schemas mesmo com delays que podem ocorrer no Kafka connect (enquanto tem evento da versão 1 para enviar, as aplicações já estão gravando a versão 2).
 
+## Formatos suportados
+
+A aplicação grava na tabela de outbox o evento **já serializado no formato do tópico de destino**. O
+transform valida o payload nesse formato e o publica sem reserializar: o value do registro são os
+bytes gravados (schema `BYTES`), e o connector usa um converter de passagem.
+
+| Formato (`payload.format` ou coluna `table.column.format`) | O que a aplicação grava | Validação antes de publicar |
+| --- | --- | --- |
+| `avro` | Saída do `KafkaAvroSerializer` | O id do schema existe e é Avro; o payload é lido inteiro com esse schema. Com `avro.use.latest.version=true` (padrão), é reescrito com a versão mais recente de `<tópico>-value` |
+| `protobuf` | Saída do `KafkaProtobufSerializer` | O id do schema existe e é Protobuf; os índices da mensagem e a mensagem são lidos com o descriptor |
+| `json_schema` | Saída do `KafkaJsonSchemaSerializer` | O id do schema existe e é JSON Schema; o conteúdo é JSON válido (e obedece ao schema com `json.fail.invalid.schema=true`) |
+| `json` | JSON em UTF-8 | Exatamente um documento JSON válido |
+| `string` (padrão) | Texto | UTF-8 válido |
+| `bytes` | Qualquer binário | Nenhuma |
+
+Com `table.column.format`, cada linha informa o próprio formato (linhas com a coluna vazia usam
+`payload.format`): uma mesma outbox alimenta tópicos em formatos diferentes.
+
+**Avro e a versão mais recente do schema.** Com `avro.use.latest.version=true`, um evento gravado com
+uma versão anterior do schema é convertido pela resolução de schemas do Avro (campos novos recebem o
+default) e publicado com o id da versão mais recente do subject. Um evento gravado com uma versão
+**mais nova** que a do cache (`schema.cache.ttl`) é publicado como está: o transform nunca rebaixa um
+evento nem descarta campos. Com `false`, cada evento sai com o schema com que foi gravado.
+
+Payload nulo publica um tombstone (value nulo), para tópicos compactados.
+
+Cada evento gera uma linha em DEBUG no logger `transform.outbox.JdbcOutbox`:
+`Outbox event routed to topic orders.events.json: key=order-2001, format=json, 43 bytes`.
+
+## Compatibilidade e build
+
+| | Versão |
+| --- | --- |
+| Kafka Connect | 4.x (compilado contra 4.3.1, bytecode Java 17) |
+| Cliente do Schema Registry e providers Avro, Protobuf e JSON Schema do Confluent | 8.3.2, empacotados no plugin |
+| Build | Gradle 9.5.1 (wrapper) com JDK 25 |
+
+```bash
+./gradlew build            # testes + build/distributions/kconnect-jdbc-outbox-smt-<versão>.zip
+./gradlew connectPlugin    # build/connect-plugin/kconnect-jdbc-outbox-smt/, pronto para o plugin.path
+```
+
+O plugin é um **diretório**, não um jar único: o jar do transform mais as dependências de runtime
+(cliente do Schema Registry, Avro, providers de Protobuf e JSON Schema). As bibliotecas do Kafka e o
+SLF4J ficam de fora porque o worker já as fornece. Copie o diretório inteiro para o `plugin.path` do
+worker (ex.: `/opt/kafka/plugins/kconnect-jdbc-outbox-smt/`).
+
+O value converter do connector não depende do formato:
+
+| Connector | `value.converter` |
+| --- | --- |
+| JDBC Source | `org.apache.kafka.connect.converters.ByteArrayConverter` |
+| Debezium | `io.debezium.converters.BinaryDataConverter` com `value.converter.delegate.converter.type=org.apache.kafka.connect.json.JsonConverter`: os heartbeats do Debezium não são bytes e seguem pelo converter delegado |
+
+Os testes gravam os eventos com os serializers do Confluent, como as aplicações, e leem o que o
+transform publica com os deserializers do Confluent, como os consumidores.
+
+Licenças: o transform, o cliente do Schema Registry e o Avro são Apache 2.0. Os providers de Protobuf
+e JSON Schema do Confluent (`kafka-protobuf-provider`, `kafka-json-schema-provider`) são Confluent
+Community License, que permite uso interno e proíbe oferecer um serviço que concorra com o
+Confluent; são os mesmos de que as aplicações já dependem ao usar os serializers Protobuf e JSON
+Schema.
+
+## Mudanças na 2.0.0
+
+- **Incompatível**: a classe passou a se chamar `transform.outbox.JdbcOutbox`, e o value do registro são
+  os bytes do payload, não mais dados do Connect para o `AvroConverter`. Troque `transforms.<nome>.type`
+  e o `value.converter` (tabela acima); o plugin não traz mais o `AvroConverter`. O formato padrão
+  passou a ser `string`: connectors com payload Avro declaram `payload.format=avro`.
+- Formatos `avro`, `protobuf`, `json_schema`, `json`, `string` e `bytes`, por connector
+  (`payload.format`) ou por linha (`table.column.format`), validados antes da publicação.
+- `schema.registry.url` só é obrigatório para os formatos com Schema Registry e aceita uma lista
+  separada por vírgulas.
+- **Correção**: um evento gravado com uma versão anterior do schema é convertido para o schema mais
+  recente do tópico por resolução de schemas do Avro (campos novos recebem o default). Antes, qualquer
+  campo adicionado ao schema fazia o transform falhar com `ArrayIndexOutOfBoundsException` nos eventos
+  antigos ainda na fila.
+- **Correção**: um evento gravado com uma versão mais nova que a do cache não é mais rebaixado (antes,
+  perdia os campos novos até o cache expirar).
+- **Correção**: o schema publicado é o registrado pela aplicação, não um derivado do modelo de dados do
+  Connect pelo `AvroConverter`.
+- **Correção**: `table.column.partition` aceita qualquer coluna numérica (antes, `INTEGER` gerava
+  `ClassCastException`; só `DECIMAL`/`NUMERIC` funcionava).
+- `table.column.payload.encode=string` para colunas texto (`text`, `jsonb`); `byte_array` aceita o
+  `ByteBuffer` que o Debezium entrega.
+- Falhas transitórias do Schema Registry (indisponível, 5xx, 408, 429) viram `RetriableException`:
+  com `errors.retry.timeout` no connector, o Kafka Connect repete o registro em vez de parar a task.
+- Configuração inválida gera `ConfigException` na criação do connector; o `config()` do transform
+  declara todas as opções.
+- O cliente do Schema Registry recebe as propriedades padrão do cliente Confluent informadas no
+  transform (basic auth, TLS), e os valores de configuração deixaram de ser logados.
+- Kafka Connect 4, Confluent 8.3.2, Gradle 9.5.1; bytecode Java 17. Timestamp do registro independente
+  do fuso horário da JVM.
+- Implementa `Versioned` e publica o manifesto `ServiceLoader` do transform
+  (`plugin.discovery=service_load`).
+
 ## Como usar 
 
 Essa lib foi usada para usar como exemplo em aula de implementação de outbox, pode conferir [aqui](https://github.com/luizroos/hands-on-microservices/tree/e15), nele ensino a subir o kafka, criar uma imagem do kafka connect com esse transform e executar lendo de uma aplicação de teste.
@@ -47,25 +143,20 @@ De qualquer forma, os parâmetros básicos para se usar são esses:
 
     "connection.url": "jdbc:mysql://mysql:3306/sample-db",
     "connection.user": "db_user",
-    "connection.password": "db_pass",
+    "connection.password": "${env:CONNECTOR_SECRET_DB_PASSWORD}",
     "connection.attempts": "5",
     "connection.backoff.ms": "1000",
     "schema.pattern": "sample-db",
 
-    "value.converter": "io.confluent.connect.avro.AvroConverter",  // (3) usamos o AvroConverter pois o transform hoje só funciona para tabelas outbox que gravam a mensagem serializada em avro
-    "value.converter.use.latest.version": "true",
-    "value.converter.enhanced.avro.schema.support": "true",
-    "value.converter.schema.registry.url": "http://schema-registry:8081",
-    "value.converter.auto.register.schemas": "true",
-    "value.converter.schemas.enable": "true",
-    "value.converter.connect.meta.data": "false",
+    "value.converter": "org.apache.kafka.connect.converters.ByteArrayConverter",  // (3) o transform entrega o payload pronto, em bytes
 
     "transforms": "outbox",
-    "transforms.outbox.type": "transform.outbox.AvroJdbcOutbox",   // (4) declamaramos o transform.
+    "transforms.outbox.type": "transform.outbox.JdbcOutbox",   // (4) declaramos o transform.
     "transforms.outbox.schema.registry.url": "http://schema-registry:8081",  // (5) informamos qual a url do schema registry.
-    "transforms.outbox.table.column.payload": "message_payload",  // (6) informamos qual a coluna que tem gravado o payload da mensagem.
-    "transforms.outbox.table.column.key": "message_key",  // (7) informamos qual a coluna que grava a chave que será usada para enviar a mensagem.
-    "transforms.outbox.table.column.topic": "message_topic"  // (8) informamos qual a coluna que grava o tópico que aquela mensagem pertence
+    "transforms.outbox.payload.format": "avro",  // (6) formato do payload gravado (e publicado).
+    "transforms.outbox.table.column.payload": "message_payload",  // (7) informamos qual a coluna que tem gravado o payload da mensagem.
+    "transforms.outbox.table.column.key": "message_key",  // (8) informamos qual a coluna que grava a chave que será usada para enviar a mensagem.
+    "transforms.outbox.table.column.topic": "message_topic"  // (9) informamos qual a coluna que grava o tópico que aquela mensagem pertence
   }
 }
 ```
@@ -74,16 +165,52 @@ Descrição de todos os parâmetros:
 
 | Nome                        | Obrigatório | Descrição |
 |---------------------------- |:-------------:| -----:|
-| schema.registry.url         | sim           | Endpoint do schema registry. |
-| schema.cache.ttl            | não           | Tempo em minutos que o schema do tópico vai ficar cacheado, default é 60 minutos. Na prática é o tempo máximo para que uma mudança de schema na gravação do schema demora para replicar para o tópico |
+| schema.registry.url         | para avro, protobuf e json_schema | Endpoints do schema registry, separados por vírgula. |
+| schema.cache.ttl            | não           | Tempo em minutos que o schema mais recente de cada tópico fica em cache, default é 60 minutos. Na prática é o tempo máximo para eventos gravados com versões anteriores passarem a sair com uma nova versão do schema Avro |
+| payload.format              | não           | Formato do payload: string (default), avro, protobuf, json_schema, json ou bytes |
+| table.column.format         | não           | Nome da coluna com o formato de cada linha (mesmos valores de payload.format); vazia usa payload.format |
+| avro.use.latest.version     | não           | true (default): publica Avro com a versão mais recente de `<tópico>-value`, sem nunca rebaixar um evento; false: publica com o schema com que o evento foi gravado |
+| json.fail.invalid.schema    | não           | true: recusa payloads json_schema que não obedecem ao schema (default false, como nos serializers do Confluent) |
 | table.column.payload        | sim           | Nome da coluna que tem os dados da mensagem |
-| table.column.payload.encode | não           | Como o payload está encodado na tabela, opções possíveis são base64 (valor default) e byte_array) |
+| table.column.payload.encode | não           | Como o payload está na tabela: base64 (valor default), byte_array (coluna binária) ou string (coluna texto, publicada em UTF-8) |
 | table.column.key            | sim           | Nome da coluna que tem a chave da mensagem. Não é a PK da tabela, é a chave que será usada como partition key no envio da mensagem |
 | table.column.key.encode     | não           | Se a key estiver encodada na tabela, opções possíveis são string (valor default), base64 e byte_array) |
 | table.column.topic          | não           | Nome da coluna que tem o nome do tópico que deve ser enviado a mensagem. Apesar de opcional, se não for informado, deve ser informado o parâmetro routing.topic |
 | routing.topic               | não           | Nome do tópico que deve ser encaminhado a mensagem, sobrescreve table.column.topic. Use se você tem várias tabelas de outbox ou vai filtrar os eventos de cada tópico via query |
 | table.column.headers        | não           | Nome das colunas, separadas por vírgula, para serem adicionadas ao header da mensagem  |
 | table.column.partition      | não           | Nome da coluna que mapeia o número da partição que as mensagens devem ser publicadas  |
+| propriedades do cliente do Schema Registry | não | Repassadas ao cliente, ex.: `basic.auth.credentials.source=USER_INFO` e `basic.auth.user.info` (use um config provider, nunca o valor literal), `schema.registry.ssl.truststore.location` |
+
+### Com Debezium PostgreSQL (CDC em vez de polling)
+
+O transform só precisa receber a linha da tabela de outbox como um registro plano. Com o Debezium,
+aplique antes o `ExtractNewRecordState` e restrinja os dois transforms à tabela de outbox com um
+predicate. Os heartbeats do Debezium passam intactos pelos transforms e chegam ao
+`BinaryDataConverter` como dados do Connect, que ele entrega ao converter delegado:
+
+```json
+{
+  "value.converter": "io.debezium.converters.BinaryDataConverter",
+  "value.converter.delegate.converter.type": "org.apache.kafka.connect.json.JsonConverter",
+  "value.converter.delegate.converter.type.schemas.enable": "false",
+  "transforms": "unwrap,outbox",
+  "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+  "transforms.unwrap.delete.tombstone.handling.mode": "drop",
+  "transforms.unwrap.predicate": "isOutboxTable",
+  "transforms.outbox.type": "transform.outbox.JdbcOutbox",
+  "transforms.outbox.predicate": "isOutboxTable",
+  "transforms.outbox.schema.registry.url": "http://schema-registry:8081",
+  "transforms.outbox.table.column.format": "message_format",
+  "transforms.outbox.table.column.key": "message_key",
+  "transforms.outbox.table.column.payload": "message_payload",
+  "transforms.outbox.table.column.payload.encode": "byte_array",
+  "transforms.outbox.table.column.topic": "message_topic",
+  "predicates": "isOutboxTable",
+  "predicates.isOutboxTable.type": "org.apache.kafka.connect.transforms.predicates.TopicNameMatches",
+  "predicates.isOutboxTable.pattern": "<topic.prefix>\\.public\\.<tabela_outbox>",
+  "errors.retry.timeout": "300000"
+}
+```
 
 ### Exemplos
 
